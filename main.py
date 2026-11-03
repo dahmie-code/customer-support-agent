@@ -27,6 +27,7 @@ from strands.tools.mcp.mcp_client import MCPClient
 from mcp.client.streamable_http import streamable_http_client
 import argparse, json
 import os, asyncio, boto3
+from contextlib import ExitStack
 from strands.hooks import (
     HookProvider, AfterInvocationEvent, HookRegistry, MessageAddedEvent,
 )
@@ -66,10 +67,10 @@ os.environ["BYPASS_TOOL_CONSENT"] = "true"
 # REGION:     your AWS region, e.g. "us-east-1"
 # MEMORY_ID   format: shown in the AgentCore Memory console
 
-GATEWAY_URL = "https://customersupportgateway-ghqcmtavum.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
-KB_ID       = "XFLYOROZWI"         
+GATEWAY_URL = "https://customersupportgateway-fcpmoa2e9p.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+KB_ID       = "U19WXDH0DK"         
 REGION      = "us-east-1"      
-MEMORY_ID   = "CustomerSupportMemory-0enlDFFOPk"
+MEMORY_ID   = "CustomerSupportMemory-Ity05i69Og"
 
 
 # ── TODO 3 — Model and Clients ────────────────────────────────────────────────
@@ -365,7 +366,7 @@ def calculate_loyalty_discount(
         product_category: standard, device, or fresh
 
     Returns:
-        Full discount breakdown and final price
+        Calculation breakdown, or tier-discount details if the interpreter is unavailable
     """
     code = f"""
 import json
@@ -402,48 +403,55 @@ print(json.dumps(result))
 
     try:
         with code_session(REGION) as session:
-            response = session.execute_code(code, language="python", clear_context=True)
+            response = session.invoke(
+                "executeCode",
+                {
+                    "code": code,
+                    "language": "python",
+                    "clearContext": True,
+                },
+            )
 
-        stream = response.get("stream", [])
-        for event in stream:
-            result = event.get("result")
-            if not result:
-                continue
-            if isinstance(result, dict):
-                if "content" in result:
-                    for item in result["content"]:
-                        if isinstance(item, dict) and "text" in item:
-                            payload = item["text"]
-                            try:
-                                return json.dumps(json.loads(payload))
-                            except Exception:
-                                return payload
-                for value in result.values():
-                    if isinstance(value, str):
-                        try:
-                            return json.dumps(json.loads(value))
-                        except Exception:
-                            return value
-            elif isinstance(result, str):
-                try:
-                    return json.dumps(json.loads(result))
-                except Exception:
-                    return result
-        return json.dumps(response)
+        first_result = next(
+            (
+                event["result"]
+                for event in response.get("stream", [])
+                if isinstance(event, dict) and "result" in event
+            ),
+            None,
+        )
+        if first_result is None:
+            raise RuntimeError("Code Interpreter response did not contain a result event.")
+
+        if isinstance(first_result, dict):
+            content = first_result.get("content", [])
+            output_text = next(
+                (
+                    item["text"]
+                    for item in content
+                    if isinstance(item, dict) and isinstance(item.get("text"), str)
+                ),
+                None,
+            ) if isinstance(content, list) else None
+            if output_text is not None:
+                return json.dumps(json.loads(output_text))
+            if any(
+                key in first_result
+                for key in ("points_redeemed", "tier_discount_percent", "final_total")
+            ):
+                return json.dumps(first_result)
+            raise RuntimeError("Code Interpreter result did not contain JSON output.")
+
+        if isinstance(first_result, str):
+            return json.dumps(json.loads(first_result))
+        raise RuntimeError("Code Interpreter returned an unsupported result format.")
 
     except Exception:
         tier_rate = {"Silver": 0.0, "Gold": 0.10, "Platinum": 0.15}.get(tier, 0.0)
         tier_discount = order_total * tier_rate
-        final_total = max(order_total - tier_discount, 0.0)
         result = {
-            "points_redeemed": 0,
             "tier_discount_percent": round(tier_rate * 100, 2),
             "tier_discount_amount": round(tier_discount, 2),
-            "final_total": round(final_total, 2),
-            "total_savings": round(order_total - final_total, 2),
-            "points_earned": 0,
-            "remaining_points": loyalty_points,
-            "product_category": product_category,
             "tier": tier,
         }
         return json.dumps(result)
@@ -483,23 +491,47 @@ async def invoke(payload, context=None):
         agent_core_browser = AgentCoreBrowser(region=REGION)
 
         tools = [search_knowledge_base, calculate_loyalty_discount, agent_core_browser.browser]
+        gateway_tools_available = False
 
-        gateway_client = MCPClient(
-            lambda: streamable_http_client(url=GATEWAY_URL)
-        )
-        with gateway_client:
-            gateway_tools = gateway_client.list_tools_sync()
-            tools.extend(gateway_tools)
+        with ExitStack() as stack:
+            try:
+                gateway_client = stack.enter_context(
+                    MCPClient(lambda: streamable_http_client(url=GATEWAY_URL))
+                )
+                gateway_tools = gateway_client.list_tools_sync()
+                tools.extend(gateway_tools)
+                gateway_tools_available = bool(gateway_tools)
+                if not gateway_tools_available:
+                    logger.warning("AgentCore Gateway connected but returned no tools.")
+            except Exception:
+                logger.exception("AgentCore Gateway unavailable; continuing with base tools.")
 
+            system_prompt = (
+                "You are a helpful customer support AI for an online store. "
+                "Use the knowledge base, loyalty calculator, gateway tools, and browser "
+                "to answer product questions, loyalty rewards, order questions, and refunds. "
+                "For live web tasks, browser use is mandatory and takes priority: whenever "
+                "the user asks you to visit a URL, inspect a website, or report live page "
+                "details such as its title, you MUST call the browser tool to navigate to "
+                "the requested URL and inspect the page before answering. Never give an "
+                "accessibility fallback or answer from general knowledge before attempting "
+                "the browser. Say the page could not be accessed only if the browser tool "
+                "was actually called and failed. For non-live tasks, use the relevant "
+                "knowledge-base, loyalty, or Gateway tools as appropriate."
+            )
+            if not gateway_tools_available:
+                system_prompt += (
+                    " Order-tracking and refund Gateway tools are unavailable for this request. "
+                    "Do not claim to have looked up live account details, tracked an order, or "
+                    "submitted a refund. Explain that these actions are temporarily unavailable. "
+                    "You may still answer general questions using the available knowledge base "
+                    "and other tools."
+                )
             agent = Agent(
                 model=model,
                 tools=tools,
                 hooks=[memory_hook],
-                system_prompt=(
-                    "You are a helpful customer support AI for an online store. "
-                    "Use the knowledge base, loyalty calculator, gateway tools, and browser "
-                    "to answer orders, refunds, product questions, loyalty rewards, and web lookups."
-                ),
+                system_prompt=system_prompt,
             )
 
             result = agent(user_input)
@@ -511,7 +543,7 @@ async def invoke(payload, context=None):
             return _extract_text(result.message)
     except Exception as exc:
         logger.exception("Agent invocation failed: %s", exc)
-        return f"I couldn't process that request right now: {exc}"
+        return "I couldn't process that request right now. Please try again later."
 
 
 # ── CLI entry point (do not modify) ──────────────────────────────────────────
